@@ -1,0 +1,22 @@
+docker info
+docker --version
+docker compose version
+docker compose up -d
+
+# If Windows OS doesn't have docker installed
+==> Download it from the official website and install it for the owned accound
+sudo usermod -aG docker $USER
+newgrp docker
+sudo docker info nextly ps aux | grep dockerd
+
+
+# if the docker compose plugin isn't installed
+which docker
+ls ~/.docker/cli-plugins
+ls /usr/libexec/docker/cli-plugins or ls /usr/lib/docker/cli-plugins
+
+
+sudo apt update
+sudo apt install docker-compose -y
+
+wsl --shutdown
