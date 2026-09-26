@@ -1,4 +1,3 @@
-# /rust/src/Cargo.toml
 [package]
 name = "rust"
 version = "0.1.0"

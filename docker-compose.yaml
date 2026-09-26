@@ -1,4 +1,3 @@
-# /docker-compose.yaml
 services:
   bitcoin:
     image: btcpayserver/bitcoin:24.0.1-1

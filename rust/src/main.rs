@@ -1,73 +1,56 @@
 #![allow(unused)]
-use bitcoin::hex::DisplayHex;
-use bitcoincore_rpc::bitcoin::{Amount, Address, Txid};
+use bitcoincore_rpc::bitcoin::Amount;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::Deserialize;
 use serde_json::json;
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 
-// Node access params
+// Node access params (matches docker-compose default)
 const RPC_URL: &str = "http://127.0.0.1:18443";
 const RPC_USER: &str = "alice";
 const RPC_PASS: &str = "password";
 
-/// Helper function to create or load a wallet, returning a client scoped to that wallet
-fn setup_wallet(base_rpc: &Client, name: &str) -> bitcoincore_rpc::Result<Client> {
-    let wallets = base_rpc.list_wallets()?;
-    if !wallets.contains(&name.to_string()) {
-        if base_rpc.load_wallet(name).is_err() {
-            base_rpc.create_wallet(name, Some(false), Some(false), None, None)?;
-        }
-    }
-    let wallet_url = format!("{}/wallet/{}", RPC_URL, name);
-    Client::new(&wallet_url, Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()))
-}
-
 fn main() -> bitcoincore_rpc::Result<()> {
-    // 1. Connect to Bitcoin Core RPC base daemon
+    // 1. Connect to Bitcoin Core RPC
     let base_rpc = Client::new(
         RPC_URL,
         Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
     )?;
 
-    // Fetch and display current blockchain information
-    let blockchain_info = base_rpc.get_blockchain_info()?;
-    println!("Initial blockchain height: {}", blockchain_info.blocks);
+    // 2. Helper to load or create wallets dynamically
+    let load_or_create_wallet = |wallet_name: &str| -> bitcoincore_rpc::Result<Client> {
+        let loaded = base_rpc.list_wallets()?;
+        if !loaded.contains(&wallet_name.to_string()) {
+            if base_rpc.load_wallet(wallet_name).is_err() {
+                base_rpc.create_wallet(wallet_name, None, None, None, None)?;
+            }
+        }
+        Client::new(
+            &format!("{}/wallet/{}", RPC_URL, wallet_name),
+            Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
+        )
+    };
 
-    // 2. Setup Miner and Trader wallets
-    let miner_rpc = setup_wallet(&base_rpc, "Miner")?;
-    let trader_rpc = setup_wallet(&base_rpc, "Trader")?;
+    let miner_rpc = load_or_create_wallet("Miner")?;
+    let trader_rpc = load_or_create_wallet("Trader")?;
 
-    // 3. Generate one address from Miner wallet with label "Mining Reward"
+    // 3. Generate spendable balances in Miner wallet
+    // EXPLAINER COMMENT ON BLOCK REWARD MATURITY:
+    // Coinbase outputs (block rewards) require 100 block confirmations before becoming spendable.
+    // Mining 101 blocks ensures the reward from block #1 achieves 100 confirmations and matures.
     let miner_addr = miner_rpc.get_new_address(Some("Mining Reward"), None)?.assume_checked();
-    println!("Miner Address: {}", miner_addr);
+    miner_rpc.generate_to_address(101, &miner_addr)?;
 
-    // 4. Mine blocks to this address until wallet balance is positive
-    /*
-       EXPLANATION ABOUT WALLET BALANCE FOR BLOCK REWARDS (Coinbase Maturity):
-       In Bitcoin, coinbase outputs (block rewards) are subject to a maturity rule. 
-       They cannot be spent until they are confirmed by at least 100 blocks (depth of 100).
-       This rule protects the network from funds disappearing if a chain reorganization 
-       (fork) orphans the block where the reward was originally minted.
-       Therefore, we need to mine at least 101 blocks so that the reward from the 
-       very first block becomes mature and spendable.
-    */
-    println!("Mining 101 blocks to achieve positive balance...");
-    base_rpc.generate_to_address(101, &miner_addr)?;
-
-    // Print the spendable balance of the Miner wallet
     let miner_balance = miner_rpc.get_balance(None, None)?;
-    println!("Miner Wallet Balance: {} BTC", miner_balance.to_btc());
+    println!("Miner Wallet Balance: {}", miner_balance);
 
-    // 5. Create receiving address from Trader wallet labeled "Received"
+    // 4. Create receiving address in Trader wallet
     let trader_addr = trader_rpc.get_new_address(Some("Received"), None)?.assume_checked();
-    println!("Trader Address: {}", trader_addr);
 
-    // 6. Send a transaction paying 20 BTC from Miner to Trader
-    let amount_to_send = Amount::from_btc(20.0).unwrap();
-    
-    // Execute the transaction transfer from Miner's wallet context
+    // 5. Send 20 BTC from Miner to Trader
+    let amount_to_send = Amount::from_btc(20.0).expect("Invalid BTC amount");
     let txid = miner_rpc.send_to_address(
         &trader_addr,
         amount_to_send,
@@ -78,69 +61,71 @@ fn main() -> bitcoincore_rpc::Result<()> {
         None,
         None,
     )?;
-    println!("Transaction sent! TXID: {}", txid);
 
-    // 7. Fetch the unconfirmed transaction from the node's mempool and print it
-    let mempool_entry: bitcoincore_rpc::json::GetMempoolEntryResult = base_rpc.call("getmempoolentry", &[json!(txid.to_string())])?;
-    println!("Mempool Entry Fees (Base): {} BTC", mempool_entry.fees.base.to_btc());
+    // 6. Inspect unconfirmed transaction in Mempool
+    let mempool_entry = base_rpc.get_mempool_entry(&txid)?;
+    println!("Unconfirmed Mempool Entry: {:?}", mempool_entry);
 
-    // 8. Confirm the transaction by mining 1 block
-    let block_hashes = base_rpc.generate_to_address(1, &miner_addr)?;
-    let confirmed_block_hash = block_hashes[0];
-    let block_info = base_rpc.get_block_info(&confirmed_block_hash)?;
-    println!("Confirmed at height: {}", block_info.height);
+    // 7. Mine 1 block to confirm transaction
+    let confirm_block_hashes = miner_rpc.generate_to_address(1, &miner_addr)?;
+    let confirm_block_hash = confirm_block_hashes[0];
+    let confirm_block_header = base_rpc.get_block_header_info(&confirm_block_hash)?;
+    let confirm_block_height = confirm_block_header.height;
 
-    // 9. Extract detailed information for the output file
-    // We use get_raw_transaction_info to look inside vin and vout arrays
-    let tx_info = base_rpc.get_raw_transaction_info(&txid, Some(&confirmed_block_hash))?;
+    // 8. Extract transaction output details
+    let raw_tx = miner_rpc.get_raw_transaction(&txid, None)?;
+    let decoded_tx = base_rpc.decode_raw_transaction(&raw_tx, None)?;
 
-    // Extract the input details (Miner spent a coinbase UTXO of 50.0 BTC)
-    let input_addr = miner_addr.to_string();
-    let input_amount_btc = 50.0; 
+    // Fetch details of input spent from previous transaction
+    let vin = &decoded_tx.vin[0];
+    let prev_txid = vin.txid.unwrap();
+    let prev_vout = vin.vout.unwrap();
+    let prev_raw_tx = miner_rpc.get_raw_transaction(&prev_txid, None)?;
+    let prev_decoded_tx = base_rpc.decode_raw_transaction(&prev_raw_tx, None)?;
+    let prev_output = &prev_decoded_tx.vout[prev_vout as usize];
 
-    // Extract Trader Output details
-    let mut trader_out_addr = trader_addr.to_string();
-    let mut trader_out_amount = 20.0;
+    let miner_input_addr = prev_output.script_pub_key.address.as_ref().unwrap().clone().assume_checked();
+    let miner_input_amount = prev_output.value;
 
-    // Extract Miner Change details
-    let mut change_addr = String::new();
-    let mut change_amount_btc = 0.0;
+    let mut trader_output_addr = String::new();
+    let mut trader_output_amount = Amount::ZERO;
+    let mut miner_change_addr = String::new();
+    let mut miner_change_amount = Amount::ZERO;
 
-    // Loop through vouts to locate and parse the change output properties
-    for vout in tx_info.vout {
-        if let Some(ref addr) = vout.script_pub_key.address {
-            // Convert unchecked address type to checked format to safely fetch string representations
+    for vout in &decoded_tx.vout {
+        if let Some(addr) = &vout.script_pub_key.address {
             let addr_str = addr.clone().assume_checked().to_string();
-            if addr_str != trader_out_addr {
-                change_addr = addr_str;
-                change_amount_btc = vout.value.to_btc();
+            if addr_str == trader_addr.to_string() {
+                trader_output_addr = addr_str;
+                trader_output_amount = vout.value;
+            } else {
+                miner_change_addr = addr_str;
+                miner_change_amount = vout.value;
             }
         }
     }
 
-    // Fallback if no explicit change address was found in the parsed addresses field
-    if change_addr.is_empty() {
-        change_addr = miner_addr.to_string();
-        change_amount_btc = input_amount_btc - trader_out_amount - mempool_entry.fees.base.to_btc();
-    }
+    let tx_fee = miner_input_amount - trader_output_amount - miner_change_amount;
 
-    let transaction_fee_btc = mempool_entry.fees.base.to_btc();
+    // 9. Write out.txt in root repository directory
+    let out_path = if Path::new("../out.txt").exists() || Path::new("../package.json").exists() {
+        "../out.txt"
+    } else {
+        "out.txt"
+    };
 
-    // 10. Write outputs to out.txt in the required format layout
-    let mut out_file = File::create("../out.txt").expect("Could not create output file");
-    
+    let mut out_file = File::create(out_path).expect("Failed to create out.txt");
     writeln!(out_file, "{}", txid)?;
-    writeln!(out_file, "{}", input_addr)?;
-    writeln!(out_file, "{}", input_amount_btc)?;
-    writeln!(out_file, "{}", trader_out_addr)?;
-    writeln!(out_file, "{}", trader_out_amount)?;
-    writeln!(out_file, "{}", change_addr)?;
-    writeln!(out_file, "{:.8}", change_amount_btc)?;
-    writeln!(out_file, "-{}", transaction_fee_btc)?; // Formatted with a negative sign as per sample output
-    writeln!(out_file, "{}", block_info.height)?;
-    writeln!(out_file, "{}", confirmed_block_hash)?;
+    writeln!(out_file, "{}", miner_input_addr)?;
+    writeln!(out_file, "{}", miner_input_amount.to_btc())?;
+    writeln!(out_file, "{}", trader_output_addr)?;
+    writeln!(out_file, "{}", trader_output_amount.to_btc())?;
+    writeln!(out_file, "{}", miner_change_addr)?;
+    writeln!(out_file, "{}", miner_change_amount.to_btc())?;
+    writeln!(out_file, "-{}", tx_fee.to_btc())?;
+    writeln!(out_file, "{}", confirm_block_height)?;
+    writeln!(out_file, "{}", confirm_block_hash)?;
 
-    println!("out.txt generated perfectly.");
-
+    println!("Completed successfully! out.txt generated at {}", out_path);
     Ok(())
 }
