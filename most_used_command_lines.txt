@@ -1,0 +1,7 @@
+npm run test:payments
+
+npm test
+
+cargo run --bin rust
+
+npm run build
