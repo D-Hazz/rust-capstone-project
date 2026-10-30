@@ -63,6 +63,55 @@ It's a good idea to run the whole test locally to ensure your code is working pr
 - Execute [`./test.sh`](./test.sh).
 
 If your code works, you will see the test completed successfully.
+The test script leaves the regtest node running and preserves its data so the dashboard can use the same wallets and chain afterward.
+
+### Local Regtest Dashboard Simulation
+
+Run these commands from an Ubuntu/WSL terminal at the repository root with Node.js 22.13 or newer. On Windows, install and start Docker Desktop, then enable **Settings → Resources → WSL Integration → Ubuntu-26.04**. If you have just enabled integration, run `wsl --shutdown` in PowerShell, reopen Ubuntu, and verify `docker --version` works. `sudo` is not required for these steps.
+
+Start the node, then run the Rust capstone once to create and fund the `Miner` and `Trader` wallets. The readiness check has a time limit so it will not wait forever if Docker or Bitcoin Core is unavailable.
+
+```bash
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is unavailable in this WSL distro. Start Docker Desktop and enable WSL Integration for Ubuntu-26.04." >&2
+  exit 1
+fi
+
+docker compose up -d
+
+ready=0
+for attempt in $(seq 1 60); do
+  result=$(curl --silent --fail --user alice:password \
+    --data-binary '{"jsonrpc":"1.0","id":"ready","method":"getblockchaininfo","params":[]}' \
+    -H 'content-type: text/plain;' http://127.0.0.1:18443 || true)
+  if echo "$result" | grep -q '"chain":"regtest"'; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+
+if [ "$ready" -ne 1 ]; then
+  echo "Bitcoin Core did not become ready. Container status and logs:" >&2
+  docker compose ps
+  docker compose logs --tail=80 bitcoin
+  exit 1
+fi
+
+cd rust
+cargo run --bin rust
+cd ../web
+npm ci
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The dashboard uses the same RPC defaults as Docker (`alice:password`) and automatically creates or loads the exact wallet names used by the Rust program (`Miner` and `Trader`). If the Miner wallet has no spendable balance yet, use **Miner 101 blocs pour activer le solde** once so the coinbase rewards mature. The dashboard can then send a 20 BTC transaction, inspect the mempool, and explore UTXOs, block weight, and a regtest reorganization.
+
+The dashboard is split into short pages: **Mempool** shows live fee rates and RBF actions; **UTXO** displays global statistics and wallet outputs; **Consensus** measures block weight and offers a confirmed regtest-only reorganization; **Blocs** explores decoded block and transaction data. **Paiements** provides separate receive, convert, and settle steps. The receive flow creates a Trader address and can send a test payment from Miner; conversion uses indicative BTC/USD and USD/CDF or USD/EUR spot rates; settlement spends the confirmed demo payment from Trader back to Miner. This is a local regtest simulation only and does not transfer local currency or real bitcoin. Invoice records are persisted server-side in SQLite under `web/.data/`.
+
+Payment invoices track expiry, required confirmations, partial or excess receipts, and settlement states separately: a settlement is only marked confirmed after its transaction confirms on regtest. Run `npm test` in `web/` for lifecycle and storage unit tests. Run `npm run test:payments` with the dashboard and Bitcoin regtest running for a state-changing end-to-end simulation; it sends test transactions, mines blocks, and waits for an expiring test invoice.
+
+To stop the node without deleting its data, run `docker compose stop` from the repository root. Do not use `docker compose down -v` unless you intentionally want to remove the node's stored data and wallets.
 
 ## Submission:
  - Create a commit with your local changes.

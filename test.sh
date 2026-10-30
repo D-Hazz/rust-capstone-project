@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # Load NVM into the script's subshell environment
 export NVM_DIR="$HOME/.nvm"
@@ -13,27 +14,32 @@ fi
 nvm install --lts
 npm install
 
-set -e  # Exit immediately if any command fails
-
-# Spawn Bitcoind using docker-compose
-docker-compose up -d
-sleep 10
+# Spawn Bitcoind using Docker Compose
+docker compose up -d
 
 echo "Waiting for bitcoind to be fully initialized..."
 
-while true; do
+attempt=0
+while [ "$attempt" -lt 60 ]; do
   result=$(curl --silent --user alice:password --data-binary \
     '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' \
-    -H 'content-type: text/plain;' http://127.0.0.1:18443)
+    -H 'content-type: text/plain;' http://127.0.0.1:18443 || true)
 
   if echo "$result" | grep -q '"chain"'; then
     echo "bitcoind is ready."
     break
   else
-    echo "bitcoind not ready yet, retrying in 3s..."
+    attempt=$((attempt + 1))
+    echo "bitcoind not ready yet ($attempt/60), retrying in 3s..."
     sleep 3
   fi
 done
+
+if [ "$attempt" -ge 60 ]; then
+  echo "Bitcoin Core did not become ready within 3 minutes." >&2
+  docker compose logs bitcoin
+  exit 1
+fi
 
 chmod +x ./rust/run-rust.sh
 chmod +x ./run.sh
@@ -42,5 +48,4 @@ chmod +x ./run.sh
 /bin/bash run.sh
 npm run test
 
-# Stop docker-compose
-docker-compose down -v
+echo "Tests completed; the Bitcoin node is left running and its data is preserved."
